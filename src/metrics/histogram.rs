@@ -3,8 +3,9 @@
 //! See [`Histogram`] for details.
 
 use super::{MetricType, TypedMetric};
-use parking_lot::{MappedRwLockReadGuard, RwLock, RwLockReadGuard};
+
 use std::iter::{self, once};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Open Metrics [`Histogram`] to measure distributions of discrete events.
@@ -33,7 +34,7 @@ use std::sync::Arc;
 // https://github.com/tikv/rust-prometheus/pull/314.
 #[derive(Debug)]
 pub struct Histogram {
-    inner: Arc<RwLock<Inner>>,
+    inner: Arc<Inner>,
 }
 
 impl Clone for Histogram {
@@ -47,25 +48,25 @@ impl Clone for Histogram {
 #[derive(Debug)]
 pub(crate) struct Inner {
     // TODO: Consider allowing integer observe values.
-    sum: f64,
-    count: u64,
+    sum: AtomicU64,
+    count: AtomicU64,
     // TODO: Consider being generic over the bucket length.
-    buckets: Vec<(f64, u64)>,
+    buckets: Vec<(f64, AtomicU64)>,
 }
 
 impl Histogram {
     /// Create a new [`Histogram`].
     pub fn new(buckets: impl Iterator<Item = f64>) -> Self {
         Self {
-            inner: Arc::new(RwLock::new(Inner {
+            inner: Arc::new(Inner {
                 sum: Default::default(),
                 count: Default::default(),
                 buckets: buckets
                     .into_iter()
                     .chain(once(f64::MAX))
-                    .map(|upper_bound| (upper_bound, 0))
+                    .map(|upper_bound| (upper_bound, AtomicU64::new(0)))
                     .collect(),
-            })),
+            }),
         }
     }
 
@@ -80,30 +81,34 @@ impl Histogram {
     /// Needed in
     /// [`HistogramWithExemplars`](crate::metrics::exemplar::HistogramWithExemplars).
     pub(crate) fn observe_and_bucket(&self, v: f64) -> Option<usize> {
-        let mut inner = self.inner.write();
-        inner.sum += v;
-        inner.count += 1;
+        self.inner.sum.fetch_add(nanos(v), Ordering::Relaxed);
+        self.inner.count.fetch_add(1, Ordering::Relaxed);
 
-        let first_bucket = inner
+        let first_bucket = self
+            .inner
             .buckets
-            .iter_mut()
+            .iter()
             .enumerate()
             .find(|(_i, (upper_bound, _value))| upper_bound >= &v);
 
         match first_bucket {
             Some((i, (_upper_bound, value))) => {
-                *value += 1;
+                value.fetch_add(1, Ordering::Relaxed);
                 Some(i)
             }
             None => None,
         }
     }
 
-    pub(crate) fn get(&self) -> (f64, u64, MappedRwLockReadGuard<Vec<(f64, u64)>>) {
-        let inner = self.inner.read();
-        let sum = inner.sum;
-        let count = inner.count;
-        let buckets = RwLockReadGuard::map(inner, |inner| &inner.buckets);
+    pub(crate) fn get(&self) -> (f64, u64, Vec<(f64, u64)>) {
+        let sum = seconds(self.inner.sum.load(Ordering::Relaxed));
+        let count = self.inner.count.load(Ordering::Relaxed);
+        let buckets = self
+            .inner
+            .buckets
+            .iter()
+            .map(|(k, v)| (*k, v.load(Ordering::Relaxed)))
+            .collect();
         (sum, count, buckets)
     }
 }
@@ -128,6 +133,16 @@ pub fn linear_buckets(start: f64, width: f64, length: u16) -> impl Iterator<Item
         .take(length.into())
 }
 
+#[inline(always)]
+fn nanos(val: f64) -> u64 {
+    (val * 1E9) as u64
+}
+
+#[inline(always)]
+fn seconds(val: u64) -> f64 {
+    (val as f64) * 1E-9
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,6 +151,18 @@ mod tests {
     fn histogram() {
         let histogram = Histogram::new(exponential_buckets(1.0, 2.0, 10));
         histogram.observe(1.0);
+        histogram.observe(1.5);
+        histogram.observe(2.5);
+        histogram.observe(8.5);
+        histogram.observe(0.5);
+
+        let (sum, count, buckets) = histogram.get();
+
+        assert_eq!(14., sum);
+        assert_eq!(5, count);
+        assert_eq!(2, buckets[0].1);
+        assert_eq!(1, buckets[1].1);
+        assert_eq!(1, buckets[4].1);
     }
 
     #[test]
