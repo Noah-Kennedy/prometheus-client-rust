@@ -6,6 +6,7 @@ pub mod family;
 pub mod gauge;
 pub mod histogram;
 pub mod info;
+pub mod time_histogram;
 
 /// A metric that is aware of its Open Metrics metric type.
 pub trait TypedMetric {

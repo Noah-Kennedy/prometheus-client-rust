@@ -38,6 +38,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::ops::Deref;
 
+use crate::metrics::time_histogram::TimeHistogram;
 pub use prometheus_client_derive_text_encode::*;
 
 pub fn encode<W, M>(writer: &mut W, registry: &Registry<M>) -> Result<(), std::io::Error>
@@ -582,6 +583,21 @@ fn encode_histogram_with_maybe_exemplars<S: Encode>(
     }
 
     Ok(())
+}
+
+/////////////////////////////////////////////////////////////////////////////////
+// TimeHistogram
+
+impl EncodeMetric for TimeHistogram {
+    fn encode(&self, encoder: Encoder) -> Result<(), std::io::Error> {
+        let (sum, count, buckets) = self.get();
+        // TODO: Would be better to use never type instead of `()`.
+        encode_histogram_with_maybe_exemplars::<()>(sum, count, &buckets, None, encoder)
+    }
+
+    fn metric_type(&self) -> MetricType {
+        Self::TYPE
+    }
 }
 
 /////////////////////////////////////////////////////////////////////////////////
